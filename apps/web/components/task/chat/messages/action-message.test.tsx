@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { StateProvider } from "@/components/state-provider";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { StateProvider, useAppStoreApi } from "@/components/state-provider";
+import type { StoreApi } from "zustand";
 import { ActionMessage } from "./action-message";
 import {
   sessionId as toSessionId,
@@ -36,6 +37,7 @@ const TEST_SESSION_ID = "sess-1";
 const TEST_TASK_ID = "task-1";
 const SESSION_RECOVER_METHOD = "session.recover";
 
+/** Builds a system status Message describing a transient provider retry, with an optional Cancel action. */
 function retryMessage(overrides: Partial<Message> = {}): Message {
   return {
     id: "msg-1",
@@ -70,6 +72,7 @@ function retryMessage(overrides: Partial<Message> = {}): Message {
   } as Message;
 }
 
+/** Builds the "warning" retrying metadata object for a given attempt and retry delay. */
 function transientRetryMetadata(attempt: number, retryInSeconds: number) {
   return {
     variant: "warning",
@@ -83,6 +86,7 @@ function transientRetryMetadata(attempt: number, retryInSeconds: number) {
   };
 }
 
+/** Builds an error-variant recovery Message with an optional Resume action carrying request params. */
 function recoveryMessage(withParams = false): Message {
   return retryMessage({
     content: RECOVERY_MESSAGE,
@@ -108,6 +112,7 @@ function recoveryMessage(withParams = false): Message {
   } as Partial<Message>);
 }
 
+/** Builds a running-stall notice Message for the given turn with a Cancel turn action. */
 function stalledMessage(turnId = "turn-1"): Message {
   return retryMessage({
     turn_id: turnId,
@@ -155,6 +160,52 @@ function renderAction(
       <StateProvider initialState={initialState}>{children}</StateProvider>
     ),
   });
+}
+
+/** Like renderAction, but captures the store so the test can drive live session
+ *  state transitions (STARTING/RUNNING → WAITING_FOR_INPUT) the way a real
+ *  resume does over the WebSocket. */
+function renderActionWithStore(
+  comment: Message,
+  sessionState: TaskSessionState,
+  sessionError = "",
+) {
+  let store: StoreApi<AppState> | null = null;
+  function CaptureStore() {
+    store = useAppStoreApi();
+    return null;
+  }
+  const initialState: Partial<AppState> = {
+    taskSessions: {
+      items: {
+        [TEST_SESSION_ID]: { state: sessionState, error_message: sessionError } as TaskSession,
+      },
+    },
+    turns: {
+      bySession: {},
+      activeBySession: {},
+      loadedBySession: {},
+      reconcileEpochBySession: {},
+      settledBoundaryBySession: {},
+    },
+  };
+  const utils = render(
+    <StateProvider initialState={initialState}>
+      <CaptureStore />
+      <ActionMessage comment={comment} />
+    </StateProvider>,
+  );
+  const setSessionState = (next: TaskSessionState) =>
+    act(() => {
+      store?.getState().setTaskSession({
+        id: toSessionId(TEST_SESSION_ID),
+        task_id: toTaskId(TEST_TASK_ID),
+        state: next,
+        started_at: "",
+        updated_at: "",
+      } as TaskSession);
+    });
+  return { ...utils, setSessionState };
 }
 
 describe("ActionMessage — transient retry (warning variant)", () => {
@@ -242,6 +293,25 @@ describe("ActionMessage — transient retry (warning variant)", () => {
     await waitFor(() => expect(screen.queryByText(RECOVERY_MESSAGE)).toBeNull());
   });
 
+  it("keeps the recovery card hidden after a successful resume settles back to waiting", async () => {
+    const errorMsg = recoveryMessage(true);
+
+    const { setSessionState } = renderActionWithStore(errorMsg, "WAITING_FOR_INPUT", "");
+    fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+    await waitFor(() => expect(screen.queryByText(RECOVERY_MESSAGE)).toBeNull());
+
+    // A successful resume drives the session through an active state (which
+    // hides the card via isSessionActive) and then back to WAITING_FOR_INPUT
+    // once the agent is idle again. The recovery acknowledgment must survive
+    // that intermediate unmount so the card does not reappear until the user
+    // actually sends the next message.
+    setSessionState("STARTING");
+    setSessionState("WAITING_FOR_INPUT");
+
+    expect(screen.queryByText(RECOVERY_MESSAGE)).toBeNull();
+    expect(screen.queryByTestId(RESUME_TEST_ID)).toBeNull();
+  });
+
   it("keeps a recovery card visible when the WebSocket client is unavailable", () => {
     getWebSocketClientMock.mockReturnValue(null);
     renderAction(recoveryMessage(true), "WAITING_FOR_INPUT", "");
@@ -307,6 +377,15 @@ describe("ActionMessage — running stall notice", () => {
   it("hides the running-only notice after the session settles", () => {
     const { container } = renderAction(stalledMessage(), "WAITING_FOR_INPUT");
     expect(container.firstChild).toBeNull();
+  });
+
+  it("keeps a terminal stall diagnostic visible after the session fails", () => {
+    const message = stalledMessage();
+    message.type = "error";
+
+    renderAction(message, "FAILED");
+
+    expect(screen.getByText("Still waiting on Start dev server.")).toBeTruthy();
   });
 
   it("sends agent.cancel when Cancel turn is activated", async () => {
@@ -522,6 +601,7 @@ describe("ActionMessage — remediation link", () => {
   const REMEDIATION_URL = "https://opencode.ai/workspace/wrk_01KQM7K5CYT715264YKKFB17ZY/go";
   const QUOTA_OUTPUT = "5-hour usage limit reached";
 
+  /** Builds a recovery Message carrying the given remediation URL in its metadata. */
   function recoveryMeta(remediationUrl?: string): Message {
     return retryMessage({
       content: RECOVERY_MESSAGE,

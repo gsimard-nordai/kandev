@@ -257,6 +257,16 @@ func (s *Service) launchStart(ctx context.Context, req *LaunchSessionRequest) (*
 	if err != nil {
 		return nil, err
 	}
+	if execution == nil {
+		// The automatic terminal-PR gate intentionally skips session creation.
+		// Return a successful no-op response so session.ensure and WS callers do
+		// not dereference a nil execution while the task-owned error card remains
+		// the recovery surface.
+		return &LaunchSessionResponse{
+			Success: true,
+			TaskID:  req.TaskID,
+		}, nil
+	}
 	return executionToLaunchResponse(req.TaskID, execution), nil
 }
 
@@ -382,7 +392,9 @@ func (s *Service) RecoverSession(ctx context.Context, taskID, sessionID, action 
 	}
 	switch action {
 	case "fresh_start":
-		s.clearResumeToken(ctx, sessionID)
+		if err := s.clearResumeToken(ctx, sessionID); err != nil {
+			return nil, fmt.Errorf("failed to clear resume token for fresh start: %w", err)
+		}
 	case "resume":
 		// no-op — relaunch with existing resume token
 	default:
@@ -422,6 +434,12 @@ func isMissingProfileResumeError(err error) bool {
 
 // executionToLaunchResponse converts a TaskExecution to a LaunchSessionResponse.
 func executionToLaunchResponse(taskID string, exec *executor.TaskExecution) *LaunchSessionResponse {
+	if exec == nil {
+		return &LaunchSessionResponse{
+			Success: true,
+			TaskID:  taskID,
+		}
+	}
 	resp := &LaunchSessionResponse{
 		Success:          true,
 		TaskID:           taskID,

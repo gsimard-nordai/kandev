@@ -132,6 +132,14 @@ type AgentBaseBranchPusher interface {
 	PushBaseBranchesForTask(ctx context.Context, taskID string, branches map[string]string)
 }
 
+// AgentComparisonTargetPusher pushes the durable provider-qualified comparison
+// target map to every running agentctl execution for a task. Implementations
+// must replace the complete projection, including an empty map, so a cleared
+// target cannot remain cached in a live workspace.
+type AgentComparisonTargetPusher interface {
+	PushComparisonTargetsForTask(ctx context.Context, taskID string, targets map[string]models.ComparisonTarget)
+}
+
 type BranchMaterializer interface {
 	// MaterializeBranch creates the worktree for a freshly inserted
 	// task_repositories row. Best-effort: when no active session exists yet
@@ -271,6 +279,7 @@ type Repos struct {
 	Sessions          repository.SessionRepository
 	GitSnapshots      repository.GitSnapshotRepository
 	RepoEntities      repository.RepositoryEntityRepository
+	RepositorySets    repository.RepositorySetRepository
 	RepositoryCleanup repository.RepositoryCleanupRepository
 	Executors         repository.ExecutorRepository
 	Environments      repository.EnvironmentRepository
@@ -295,6 +304,7 @@ type Service struct {
 	sessions                        repository.SessionRepository
 	gitSnapshots                    repository.GitSnapshotRepository
 	repoEntities                    repository.RepositoryEntityRepository
+	repositorySets                  repository.RepositorySetRepository
 	repositoryCleanup               repository.RepositoryCleanupRepository
 	executors                       repository.ExecutorRepository
 	environments                    repository.EnvironmentRepository
@@ -342,9 +352,11 @@ type Service struct {
 	// other's insert and commit a cycle between them.
 	dependencyEdgeMu       sync.Mutex
 	comments               CommentRepository
+	taskStateActivity      TaskStateActivityLogger
 	secretStore            secrets.SecretStore
 	workspaceSecretDeleter WorkspaceSecretDeleter
 	baseBranchPusher       AgentBaseBranchPusher
+	comparisonTargetPusher AgentComparisonTargetPusher
 	runtimeOverridesMu     sync.Mutex
 
 	workspaceSourceProviderRefresher WorkspaceSourceProviderRefresher
@@ -435,6 +447,7 @@ func NewService(repos Repos, eventBus bus.EventBus, log *logger.Logger, discover
 		sessions:              repos.Sessions,
 		gitSnapshots:          repos.GitSnapshots,
 		repoEntities:          repos.RepoEntities,
+		repositorySets:        repos.RepositorySets,
 		repositoryCleanup:     repos.RepositoryCleanup,
 		executors:             repos.Executors,
 		environments:          repos.Environments,
@@ -488,6 +501,13 @@ func (s *Service) SetWorkspaceSourceProviderRefresher(r WorkspaceSourceProviderR
 // session launch.
 func (s *Service) SetAgentBaseBranchPusher(p AgentBaseBranchPusher) {
 	s.baseBranchPusher = p
+}
+
+// SetAgentComparisonTargetPusher wires the live-update push for provider PR
+// and MR reconciliation. Optional: when unset, the persisted attachment
+// metadata remains authoritative and is hydrated at the next launch.
+func (s *Service) SetAgentComparisonTargetPusher(p AgentComparisonTargetPusher) {
+	s.comparisonTargetPusher = p
 }
 
 // SetProviderDefaultBranchProber wires the synchronous default-branch probe

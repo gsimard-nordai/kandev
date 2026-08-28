@@ -96,9 +96,17 @@ type lifecycleAdapter struct {
 	logger   *logger.Logger
 }
 
+// orchestrator.Service.currentACPSessionID selects the generation-safety seam
+// for resetAgentContext by asserting the agent manager to this unexported
+// interface; that assertion fails silently at runtime if this method is
+// missing or its signature drifts, leaving storeResumeToken's stale-event
+// guard and the reset-failure reconcile permanently inert against a defunct
+// or dead-wrong ACP session id. Pin the exact shape here so drift is a build
+// error, not a silently-dead production guard.
 var _ interface {
 	OwnsPromptGeneration(sessionID, executionID string, generation uint64) bool
 	GetPromptGenerationForSession(ctx context.Context, sessionID string) (uint64, error)
+	GetACPSessionIDForSession(sessionID string) (string, bool)
 } = (*lifecycleAdapter)(nil)
 
 // newLifecycleAdapter creates a new lifecycle adapter
@@ -151,32 +159,45 @@ func (a *lifecycleAdapter) LaunchAgent(ctx context.Context, req *executor.Launch
 	// Surface per-repo worktree results from the prepare step so the orchestrator
 	// can persist N TaskEnvironmentRepo / TaskSessionWorktree rows when multi-repo.
 	var worktrees []executor.RepoWorktreeResult
+	var requestedBaseBranch, baseBranch, baseBranchFallbackWarning string
+	if execution.PrepareResult != nil {
+		requestedBaseBranch = execution.PrepareResult.RequestedBaseBranch
+		baseBranch = execution.PrepareResult.BaseBranch
+		baseBranchFallbackWarning = execution.PrepareResult.BaseBranchFallbackWarning
+	}
 	if execution.PrepareResult != nil && len(execution.PrepareResult.Worktrees) > 0 {
 		worktrees = make([]executor.RepoWorktreeResult, 0, len(execution.PrepareResult.Worktrees))
 		for _, w := range execution.PrepareResult.Worktrees {
 			worktrees = append(worktrees, executor.RepoWorktreeResult{
-				RepositoryID:   w.RepositoryID,
-				BranchSlug:     w.BranchSlug,
-				WorktreeID:     w.WorktreeID,
-				WorktreeBranch: w.WorktreeBranch,
-				WorktreePath:   w.WorktreePath,
-				MainRepoGitDir: w.MainRepoGitDir,
-				ErrorMessage:   w.ErrorMessage,
+				TaskRepositoryID:          w.TaskRepositoryID,
+				RepositoryID:              w.RepositoryID,
+				BranchSlug:                w.BranchSlug,
+				WorktreeID:                w.WorktreeID,
+				WorktreeBranch:            w.WorktreeBranch,
+				WorktreePath:              w.WorktreePath,
+				MainRepoGitDir:            w.MainRepoGitDir,
+				RequestedBaseBranch:       w.RequestedBaseBranch,
+				BaseBranch:                w.BaseBranch,
+				BaseBranchFallbackWarning: w.BaseBranchFallbackWarning,
+				ErrorMessage:              w.ErrorMessage,
 			})
 		}
 	}
 
 	return &executor.LaunchAgentResponse{
-		AgentExecutionID: execution.ID,
-		ContainerID:      execution.ContainerID,
-		Status:           execution.Status,
-		WorktreeID:       worktreeID,
-		WorktreePath:     worktreePath,
-		WorktreeBranch:   worktreeBranch,
-		WorkspacePath:    execution.WorkspacePath,
-		Metadata:         metadata,
-		PrepareResult:    execution.PrepareResult,
-		Worktrees:        worktrees,
+		AgentExecutionID:          execution.ID,
+		ContainerID:               execution.ContainerID,
+		Status:                    execution.Status,
+		WorktreeID:                worktreeID,
+		WorktreePath:              worktreePath,
+		WorktreeBranch:            worktreeBranch,
+		RequestedBaseBranch:       requestedBaseBranch,
+		BaseBranch:                baseBranch,
+		BaseBranchFallbackWarning: baseBranchFallbackWarning,
+		WorkspacePath:             execution.WorkspacePath,
+		Metadata:                  metadata,
+		PrepareResult:             execution.PrepareResult,
+		Worktrees:                 worktrees,
 	}, nil
 }
 
@@ -216,6 +237,7 @@ func buildLifecycleLaunchRequest(
 		UseWorktree:                   req.UseWorktree,
 		WorktreeID:                    req.WorktreeID,
 		RepositoryID:                  req.RepositoryID,
+		TaskRepositoryID:              req.TaskRepositoryID,
 		RepositoryPath:                req.RepositoryPath,
 		BaseBranch:                    req.BaseBranch,
 		DefaultBranch:                 req.DefaultBranch,
@@ -223,6 +245,7 @@ func buildLifecycleLaunchRequest(
 		PRNumber:                      req.PRNumber,
 		RemoteContribution:            req.RemoteContribution,
 		ContributionDestination:       req.ContributionDestination,
+		ComparisonTarget:              req.ComparisonTarget,
 		WorktreeBranchPrefix:          req.WorktreeBranchPrefix,
 		WorktreeBranchTemplate:        req.WorktreeBranchTemplate,
 		WorktreeBranchTicket:          req.WorktreeBranchTicket,
@@ -272,6 +295,7 @@ func lifecycleRepoLaunchSpecs(repos []executor.RepoSpec) []lifecycle.RepoLaunchS
 	specs := make([]lifecycle.RepoLaunchSpec, 0, len(repos))
 	for _, r := range repos {
 		specs = append(specs, lifecycle.RepoLaunchSpec{
+			TaskRepositoryID:        r.TaskRepositoryID,
 			RepositoryID:            r.RepositoryID,
 			RepositoryPath:          r.RepositoryPath,
 			RepositoryURL:           r.RepositoryURL,
@@ -282,6 +306,7 @@ func lifecycleRepoLaunchSpecs(repos []executor.RepoSpec) []lifecycle.RepoLaunchS
 			PRNumber:                r.PRNumber,
 			RemoteContribution:      r.RemoteContribution,
 			ContributionDestination: r.ContributionDestination,
+			ComparisonTarget:        r.ComparisonTarget,
 			WorktreeID:              r.WorktreeID,
 			WorktreeBranchPrefix:    r.WorktreeBranchPrefix,
 			WorktreeBranchTemplate:  r.WorktreeBranchTemplate,
@@ -449,6 +474,14 @@ func (a *lifecycleAdapter) GetPromptGenerationForSession(ctx context.Context, se
 	return a.mgr.GetPromptGenerationForSession(ctx, sessionID)
 }
 
+// GetACPSessionIDForSession forwards to the lifecycle manager so
+// orchestrator.Service.currentACPSessionID observes the live execution's
+// actual ACP session identity in production, not just in tests against
+// mockAgentManager (see the compile-time assertion above this type).
+func (a *lifecycleAdapter) GetACPSessionIDForSession(sessionID string) (string, bool) {
+	return a.mgr.GetACPSessionIDForSession(sessionID)
+}
+
 func (a *lifecycleAdapter) GetSessionAuthMethods(sessionID string) []streams.AuthMethodInfo {
 	return a.mgr.GetSessionAuthMethods(sessionID)
 }
@@ -547,6 +580,12 @@ func (a *lifecycleAdapter) IsAgentRunningForSession(ctx context.Context, session
 	return a.mgr.IsAgentRunningForSession(ctx, sessionID)
 }
 
+// ProbeAgentRunningForSession preserves probe errors so orchestrator cleanup
+// can distinguish an unavailable status check from a confirmed dead agent.
+func (a *lifecycleAdapter) ProbeAgentRunningForSession(ctx context.Context, sessionID string) (bool, error) {
+	return a.mgr.ProbeAgentRunningForSession(ctx, sessionID)
+}
+
 // IsAgentReadyForPrompt checks if the session can accept a prompt immediately.
 func (a *lifecycleAdapter) IsAgentReadyForPrompt(ctx context.Context, sessionID string) bool {
 	return a.mgr.IsAgentReadyForPrompt(ctx, sessionID)
@@ -590,6 +629,16 @@ func (a *lifecycleAdapter) PollRemoteStatusForRecords(ctx context.Context, recor
 
 func (a *lifecycleAdapter) CleanupStaleExecutionBySessionID(ctx context.Context, sessionID string) error {
 	return a.mgr.CleanupStaleExecutionBySessionID(ctx, sessionID)
+}
+
+func (a *lifecycleAdapter) CleanupStaleExecutionBySessionIDIfCurrent(
+	ctx context.Context,
+	sessionID, expectedExecutionID string,
+	expectedUpdatedAt time.Time,
+) error {
+	return a.mgr.CleanupStaleExecutionBySessionIDIfCurrent(
+		ctx, sessionID, expectedExecutionID, expectedUpdatedAt,
+	)
 }
 
 func (a *lifecycleAdapter) EnsureWorkspaceExecutionForSession(ctx context.Context, taskID, sessionID string) error {

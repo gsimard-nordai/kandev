@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -76,14 +77,15 @@ func (p *WorktreePreparer) Prepare(ctx context.Context, req *EnvPrepareRequest, 
 	// Step 1: Validate repository path
 	steps, ok := p.validateWorktreeRequest(req, stepIdx, totalSteps, onProgress, steps)
 	if !ok {
-		return &EnvPrepareResult{Success: false, Steps: steps, ErrorMessage: steps[len(steps)-1].Error, Duration: time.Since(start)}, nil
+		msg := steps[len(steps)-1].Error
+		return &EnvPrepareResult{Success: false, Steps: steps, ErrorMessage: msg, Error: errors.New(msg), Duration: time.Since(start)}, nil
 	}
 	stepIdx++
 
 	// Steps 2 (and optional sync): Create worktree (with optional pre-sync).
 	wt, steps, stepIdx, err := p.createWorktreeWithSync(ctx, req, stepIdx, totalSteps, onProgress, steps)
 	if err != nil {
-		return &EnvPrepareResult{Success: false, Steps: steps, ErrorMessage: err.Error(), Duration: time.Since(start)}, nil
+		return &EnvPrepareResult{Success: false, Steps: steps, ErrorMessage: err.Error(), Error: err, Duration: time.Since(start)}, nil
 	}
 
 	if len(wt.CopiedFiles) > 0 || len(wt.CopyFilesWarnings) > 0 {
@@ -131,13 +133,16 @@ func (p *WorktreePreparer) Prepare(ctx context.Context, req *EnvPrepareRequest, 
 	}
 
 	return &EnvPrepareResult{
-		Success:        true,
-		Steps:          steps,
-		WorkspacePath:  workspacePath,
-		Duration:       time.Since(start),
-		WorktreeID:     wt.ID,
-		WorktreeBranch: wt.Branch,
-		MainRepoGitDir: mainRepoGitDir,
+		Success:                   true,
+		Steps:                     steps,
+		WorkspacePath:             workspacePath,
+		Duration:                  time.Since(start),
+		WorktreeID:                wt.ID,
+		WorktreeBranch:            wt.Branch,
+		MainRepoGitDir:            mainRepoGitDir,
+		RequestedBaseBranch:       req.BaseBranch,
+		BaseBranch:                wt.BaseBranch,
+		BaseBranchFallbackWarning: wt.BaseBranchFallbackWarning,
 	}, nil
 }
 
@@ -368,6 +373,7 @@ func (p *WorktreePreparer) prepareMultiRepo(
 			Success:      false,
 			Steps:        steps,
 			ErrorMessage: step.Error,
+			Error:        errors.New(step.Error),
 			Duration:     time.Since(start),
 		}, nil
 	}
@@ -403,6 +409,7 @@ func (p *WorktreePreparer) prepareMultiRepo(
 				Success:      false,
 				Steps:        steps,
 				ErrorMessage: err.Error(),
+				Error:        err,
 				Duration:     time.Since(start),
 			}, nil
 		}
@@ -410,12 +417,16 @@ func (p *WorktreePreparer) prepareMultiRepo(
 			createdIDs = append(createdIDs, wt.ID)
 		}
 		worktrees = append(worktrees, RepoWorktreeResult{
-			RepositoryID:   spec.RepositoryID,
-			BranchSlug:     repoBranchIdentitySlug(spec),
-			WorktreeID:     wt.ID,
-			WorktreeBranch: wt.Branch,
-			WorktreePath:   wt.Path,
-			MainRepoGitDir: filepath.Join(spec.RepositoryPath, ".git"),
+			TaskRepositoryID:          spec.TaskRepositoryID,
+			RepositoryID:              spec.RepositoryID,
+			BranchSlug:                repoBranchIdentitySlug(spec),
+			WorktreeID:                wt.ID,
+			WorktreeBranch:            wt.Branch,
+			WorktreePath:              wt.Path,
+			MainRepoGitDir:            filepath.Join(spec.RepositoryPath, ".git"),
+			RequestedBaseBranch:       spec.BaseBranch,
+			BaseBranch:                wt.BaseBranch,
+			BaseBranchFallbackWarning: wt.BaseBranchFallbackWarning,
 		})
 	}
 
@@ -439,6 +450,9 @@ func (p *WorktreePreparer) prepareMultiRepo(
 		res.WorktreeID = worktrees[0].WorktreeID
 		res.WorktreeBranch = worktrees[0].WorktreeBranch
 		res.MainRepoGitDir = worktrees[0].MainRepoGitDir
+		res.RequestedBaseBranch = worktrees[0].RequestedBaseBranch
+		res.BaseBranch = worktrees[0].BaseBranch
+		res.BaseBranchFallbackWarning = worktrees[0].BaseBranchFallbackWarning
 	}
 	return res, nil
 }
@@ -485,6 +499,7 @@ func (p *WorktreePreparer) prepareOneRepo(
 	// Sync (optional) + Create — reuses single-repo helper by translating spec→req.
 	subReq := *req
 	subReq.RepositoryID = spec.RepositoryID
+	subReq.TaskRepositoryID = spec.TaskRepositoryID
 	subReq.RepositoryPath = spec.RepositoryPath
 	subReq.RepoName = spec.RepoName
 	subReq.BaseBranch = spec.BaseBranch

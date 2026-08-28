@@ -113,7 +113,7 @@ func (m *Manager) handleCompleteEventMarkState(execution *AgentExecution, event 
 		// shows no red error banner. MarkCompleted applies the same guard, but
 		// routing here keeps the misleading "marking as failed" WARN out of logs.
 		if m.IsShuttingDown() {
-			_ = m.markStoppedDuringShutdown(execution, 1, errorMsg)
+			_ = m.markStoppedDuringShutdown(execution, 1, errorMsg, event.TurnID)
 			return
 		}
 		m.logger.Warn("error completion received, marking execution as failed",
@@ -125,7 +125,7 @@ func (m *Manager) handleCompleteEventMarkState(execution *AgentExecution, event 
 			zap.Any("event_data", event.Data),
 			zap.String("agent_command", execution.AgentCommand),
 			zap.String("acp_session_id", execution.ACPSessionID))
-		if err := m.MarkCompleted(execution.ID, 1, errorMsg); err != nil {
+		if err := m.markCompletedWithTurnID(execution.ID, 1, errorMsg, event.TurnID); err != nil {
 			m.logger.Error("failed to mark execution as failed after error completion",
 				zap.String("execution_id", execution.ID),
 				zap.Error(err))
@@ -225,11 +225,11 @@ func (m *Manager) claimPromptCompletion(
 		if current.Status != v1.AgentStatusReady {
 			current.firstActivityOnce.Do(func() {
 				claim.publishRunning = true
-				claim.runningPayload = newAgentEventPayload(current)
+				claim.runningPayload = newAgentEventPayloadWithTurnID(current, event.TurnID)
 			})
 		}
 		current.Status = v1.AgentStatusReady
-		claim.readyPayload = newAgentEventPayload(current)
+		claim.readyPayload = newAgentEventPayloadWithTurnID(current, event.TurnID)
 	})
 	if err == nil && claimed {
 		return claim, true
@@ -310,9 +310,7 @@ func (m *Manager) handleCompleteEvent(execution *AgentExecution, event *agentctl
 	}
 	m.releaseActivity(executionActivityKey(execution.ID))
 
-	execution.lastActivityAtMu.Lock()
-	execution.lastActivityAt = time.Now()
-	execution.lastActivityAtMu.Unlock()
+	execution.markAgentActivity()
 
 	// Check buffer content BEFORE any processing
 	execution.messageMu.Lock()
@@ -508,8 +506,13 @@ func isTerminalToolUpdate(event agentctl.AgentEvent) bool {
 // (available_commands_update arriving 50ms after MarkBootReady, etc.) don't
 // accidentally re-arm a freshly-booted no-prompt session as Running.
 func (m *Manager) recordActivity(execution *AgentExecution, event agentctl.AgentEvent) {
+	_, isTurnContent := turnContentEventTypes[event.Type]
 	execution.lastActivityAtMu.Lock()
 	execution.lastActivityAt = time.Now()
+	if isTurnContent {
+		execution.agentEventSincePrompt = true
+		execution.promptActivityEpoch++
+	}
 	execution.lastActivityAtMu.Unlock()
 
 	// Gate firstActivityOnce on `Status != Ready` so a delayed metadata

@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- session state intentionally keeps its coordinated actions together. */
 import type { StateCreator } from "zustand";
 import { original } from "immer";
 import type { Message, TaskSession } from "@/lib/types/http";
@@ -29,7 +30,12 @@ function ensureMessageMeta(
   sessionId: string,
 ) {
   if (!metaBySession[sessionId]) {
-    metaBySession[sessionId] = { isLoading: false, hasMore: false, oldestCursor: null };
+    metaBySession[sessionId] = {
+      isLoading: false,
+      isLoadingMore: false,
+      hasMore: false,
+      oldestCursor: null,
+    };
   }
 }
 
@@ -37,11 +43,17 @@ function ensureMessageMeta(
 function applyMessageMeta(
   metaBySession: SessionSliceState["messages"]["metaBySession"],
   sessionId: string,
-  meta: { hasMore?: boolean; oldestCursor?: string | null; isLoading?: boolean },
+  meta: {
+    hasMore?: boolean;
+    oldestCursor?: string | null;
+    isLoading?: boolean;
+    isLoadingMore?: boolean;
+  },
 ) {
   ensureMessageMeta(metaBySession, sessionId);
   if (meta.hasMore !== undefined) metaBySession[sessionId].hasMore = meta.hasMore;
   if (meta.isLoading !== undefined) metaBySession[sessionId].isLoading = meta.isLoading;
+  if (meta.isLoadingMore !== undefined) metaBySession[sessionId].isLoadingMore = meta.isLoadingMore;
   if (meta.oldestCursor !== undefined) metaBySession[sessionId].oldestCursor = meta.oldestCursor;
 }
 
@@ -58,6 +70,7 @@ function mergeMessageFields(target: Record<string, unknown>, source: Record<stri
   }
 }
 
+/** Return a new messages array with the message matching `messageId` removed. */
 function removeMessageByID(messages: Message[], messageId: string) {
   return messages.filter((message) => message.id !== messageId);
 }
@@ -139,11 +152,31 @@ function mergeCancellationProjection(
 /** Merge an incoming session update with an existing session, preserving nullable fields. */
 function mergeTaskSession(existing: TaskSession, incoming: TaskSession): TaskSession {
   const cancellation = mergeCancellationProjection(existing, incoming);
+  const incomingRouteGeneration = incoming.route_generation;
+  const existingRouteGeneration = existing.route_generation;
+  const routeIsStale =
+    existingRouteGeneration !== undefined &&
+    (incomingRouteGeneration === undefined || incomingRouteGeneration < existingRouteGeneration);
   const pendingAction = mergePendingActionProjection(existing, incoming);
   return {
     ...existing,
     ...incoming,
     ...cancellation,
+    ...(routeIsStale
+      ? {
+          execution_profile_id: existing.execution_profile_id,
+          route_generation: existing.route_generation,
+          route_state: existing.route_state,
+          route_reason: existing.route_reason,
+          route_error_code: existing.route_error_code,
+          route_error_class: existing.route_error_class,
+          route_catalogue_version: existing.route_catalogue_version,
+          route_retry_ordinal: existing.route_retry_ordinal,
+          route_deadline: existing.route_deadline,
+          route_pending_outcome: existing.route_pending_outcome,
+          downstream_acp_session_id: existing.downstream_acp_session_id,
+        }
+      : {}),
     ...pendingAction,
     agent_profile_snapshot: incoming.agent_profile_snapshot ?? existing.agent_profile_snapshot,
     worktree_id: incoming.worktree_id ?? existing.worktree_id,
@@ -242,6 +275,7 @@ export const defaultSessionState: SessionSliceState = {
 type ImmerSet = Parameters<typeof createSessionSlice>[0];
 type ImmerGet = () => SessionSlice;
 
+/** Create the message store actions (set, add, update, remove, merge, prepend, metadata) backed by the given Immer setter. */
 function buildMessageActions(set: ImmerSet) {
   return {
     setMessages: (
@@ -327,7 +361,9 @@ function buildMessageActions(set: ImmerSet) {
           ...existing,
         ];
         ensureMessageMeta(draft.messages.metaBySession, sessionId);
-        draft.messages.metaBySession[sessionId].isLoading = false;
+        // isLoadingMore is owned by the shared pagination coordinator (raised
+        // on the session's first in-flight request, cleared only when the
+        // last one settles); a prepend must not clear it mid-flight.
         if (meta) applyMessageMeta(draft.messages.metaBySession, sessionId, meta);
       }),
     setMessagesMetadata: (
@@ -344,6 +380,7 @@ function buildMessageActions(set: ImmerSet) {
   };
 }
 
+/** Create the task-plan store actions (set, loading, saving, clear, seen, revisions, preview, compare) backed by the given Immer setter and getter. */
 function buildTaskPlanActions(set: ImmerSet, get: ImmerGet) {
   return {
     setTaskPlan: (taskId: string, plan: Parameters<SessionSlice["setTaskPlan"]>[1]) => {
@@ -439,6 +476,7 @@ function buildTaskPlanActions(set: ImmerSet, get: ImmerGet) {
   };
 }
 
+/** Create the walkthrough store actions (set, active step, seen) backed by the given Immer setter and getter. */
 function buildWalkthroughActions(set: ImmerSet, get: ImmerGet) {
   return {
     setWalkthrough: (
@@ -480,6 +518,7 @@ function buildWalkthroughActions(set: ImmerSet, get: ImmerGet) {
   };
 }
 
+/** Create the plan preview/compare actions (set preview revision, toggle and clear compare pair) backed by the given Immer setter. */
 function buildPreviewCompareActions(set: ImmerSet) {
   return {
     setPreviewRevision: (taskId: string, revisionId: string | null) =>
@@ -518,6 +557,7 @@ function nextPair(
   return [current[1], revisionId];
 }
 
+/** Create the task-session store actions (set, read cursor, remove, list, upsert from event, loading) backed by the given Immer setter. */
 function buildTaskSessionActions(set: ImmerSet) {
   return {
     setTaskSession: (session: Parameters<SessionSlice["setTaskSession"]>[0]) =>
@@ -624,6 +664,7 @@ function buildTaskSessionActions(set: ImmerSet) {
   };
 }
 
+/** Create the session slice, combining the default state with all session action builders wired to the store's Immer set/get. */
 export const createSessionSlice: StateCreator<
   SessionSlice,
   [["zustand/immer", never]],
